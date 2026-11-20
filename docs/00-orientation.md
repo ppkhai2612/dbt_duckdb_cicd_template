@@ -1,0 +1,174 @@
+# Docs 00 — What problem are we actually solving?
+
+You already know dbt. You can write a model, add a test, run `dbt build`, and reason about a DAG. This project is not about any of that.
+
+It's about the question that comes **after** you know dbt:
+
+> **Someone opens a pull request that changes one model. How do you know it's safe to merge — without rebuilding your entire warehouse to find out?**
+
+Everything here is in service of answering that.
+
+## The situation before CI/CD
+
+Here's how a team without CI/CD usually works. See how much of it is familiar:
+1. You edit `stg_payments.sql` on your laptop.
+2. You run `dbt build` locally. It passes.
+3. You open a PR. A colleague reads the diff and says "looks good to me."
+4. You merge.
+5. Production runs that night.
+6. At 6am, a dashboard is broken.
+
+The failure isn't laziness — **every step there was done properly**. The problem is structural. Three things went unverified:
+- Your laptop ran against **your** data, which may not match production's.
+- Your colleague reviewed **SQL text**, not **results**. Nobody can eyeball a join and know whether it fans out a row count.
+- Nothing checked what your change did to the **17 models downstream** of the one you touched.
+
+CI/CD closes exactly those three gaps. That's its whole job. The acronym is two jobs, though. Not one.
+
+## What CI and CD actually are
+
+People say "CI/CD" as if it were a single feature you install. It is two jobs that share a handshake.
+- **CI — continuous integration**. A pull request opened. Prove the change is safe before it can merge.
+- **CD — continuous deployment**. That pull request merged to `main`. Apply the change to production.
+
+Take `stg_payments`. You edit it. You open a PR. Two different machines will run two different commands:
+
+| When | Job | What runs | Where it writes | If it fails |
+|-|-|-|-|-|
+| PR opened | CI | only what changed | `ci_pr_42` (thrown away) | the PR goes red; prod is untouched |
+| PR merged | CD | everything | `staging` / `marts` (the warehouse) | someone gets paged; prod is already wrong |
+
+Same model. Same repo. Two jobs.
+
+The wrong picture: "**CI/CD means GitHub Actions.**"
+
+GitHub Actions is just the runner — a laptop you do not own. You can do both jobs on your machine. Docs 01–04 do exactly that. The YAML files in Docs 05–06 only press the same buttons.
+
+The handshake is why they get written as one acronym. CD's production run writes `manifest.json`. Tomorrow's CI job downloads it and asks, "what changed since last night?" No CD artifact, no Slim CI. The two jobs need each other.
+
+Tiny mental model: **CI is the dress rehearsal. CD is opening night**. CI uses a disposable set. CD is the real stage. The manifest is the notes the rehearsal reads so it does not have to rebuild the whole set.
+
+## The core idea: an environment is not a dbt feature
+
+This is the single most important sentence in the project:
+
+> **An "environment" is just a target: a place to write, and a name to write under**.
+
+There is no `environment:` key in dbt. There's no special mode. When people say "our CI environment," they mean **a set of connection details in `profiles.yml` that happens to point somewhere disposable**. That's it.
+
+We'll use three:
+
+|| `dev` | `ci` | `prod` |
+|-|-|-|-|
+| **Who runs it** | you, on your laptop | GitHub Actions, on a PR | GitHub Actions, on merge to `main` |
+| **Schema** | `dev` | `ci_pr_42` | `prod` |
+| **What is builds** | whatever you select | only what changed | everything |
+| **Lifetime** | as long as you want | deleted after the PR | it is the warehouse |
+| **If it breaks** | nobody notices | the PR goes red | someone gets paged |
+
+Note the last row. That's the real hierarchy: each environment exists to catch mistakes before they reach the one below it.
+
+### Where they live
+
+We're using DuckDB, so our "warehouse" is a single file: `database/database.duckdb`. All three environments **live inside that one file**, separated only by schema:
+
+```
+database/database.duckdb
+├── dev          ← you
+├── ci_pr_42     ← a pull request, temporarily
+├── raw          ┐
+├── staging      │
+├── intermediate ├── production
+└── marts        ┘
+```
+
+(Production splits into layers because lots of people query it; dev and CI stay flat because each has exactly one consumer. Docs 02 covers why.)
+
+This is not a DuckDB quirk — it's exactly how Snowflake, BigQuery and Redshift teams do it. You don't get a separate warehouse per environment. You get one warehouse, and you separate environments by **schema naming convention**.
+
+## The second idea: production has two outputs
+
+When your production job runs, you probably think of it as producing **tables**.
+
+It produces two things:
+
+```
+dbt build --target prod
+   │
+   ├──> the tables          (what everyone thinks about)
+   └──> target/manifest.json  (what makes CI possible)
+```
+
+`manifest.json` is a complete description of your project at the moment it ran: every model, its compiled SQL, its dependencies, and — crucially — a **checksum of each model's file contents**.
+
+Hold onto that. Because if CI has production's manifest, it can compare it against the current code and answer a question it otherwise couldn't:
+
+> **"Which models actually changed?"**
+
+And once you can answer that, you can build only those. That's "Slim CI," and it's the payoff of this whole project.
+
+## What we're going to build
+
+```
+  merge to main ──> cd.yml ───> dbt build --target prod   (build everything)
+                                      │
+                                      └──> upload artifact:
+                                             manifest.json + database.duckdb
+                                                    │
+                                                    │  (GitHub stores it)
+                                                    ▼
+  open a PR ──────> ci.yml ───> download that artifact
+                                      │
+                                      └──> dbt build --target ci \
+                                             --select state:modified+ \
+                                             --defer --state ./prod_dbt_artifacts
+
+                                    builds ONLY changed models  ──> ci_pr_42
+                                    everything else resolves to ──> prod
+```
+
+Three flags in CI command:
+- `--select state:modified+` — "only models that differ from production, **plus everything downstream of them**" (that's what the `+` means)
+- `--state ./prod_dbt_artifacts` — "production's manifest is in this folder; compare against it"
+- `--defer` — "for anything I did not build, use production's version instead"
+
+Without these, a PR check has to rebuild your whole project. With them, a one-model change builds one model.
+
+## How this project runs
+
+Nine short docs. **Docs 01–04 never touch GitHub Actions** — you'll do slim CI by hand, on your laptop, until it's boring. Only then do we automate it.
+
+That order is deliberate. If you meet `--defer` for the first time inside a YAML file on a remote runner, it's magic. If you've already run it yourself and watched it fail without the flag, it's just a command.
+
+| # | Docs |
+|-|-|
+| 00 | ← you are here |
+| 01 | The project, and your `dev` environment |
+| 02 | Adding `ci` and `prod` — what a target really is |
+| 03 | State: what's actually inside `manifest.json` |
+| 04 | Defer: making a build fail, then fixing it with one flag |
+| 05 | Your first workflow — production (CD) |
+| 06 | Slim CI on a real pull request |
+| 07 | Feedback and guardrails |
+| 08 | Where the training wheels are (and what's different on Snowflake) |
+
+## ✅ Checkpoint
+
+Answer these in your own words before moving on.
+1. A colleague says: "**We should add a `ci` environment to our dbt project**." Concretely, what file would they edit, and what would they add to it?
+
+    - Answer: Add `ci` key into `profiles.yml`
+
+2. You open a PR that edits `stg_payments`. Then you merge it. **Which of those is CI, which is CD**, and what is different about where they write?
+
+    - Answer: When opening a PR, that's CI. When PR merged, that's CD. CI and CD are separated into independent environments based on a schema naming convention within the same data warehouse. Therefore, they write the results on these different schemas.
+
+3. Your production job finished successfully last night. It produced the tables. **What else did it produce**, and why does tomorrow's pull request care?
+    
+    - Answer: The production job also produced `target/manifest.json`, which contains a complete description of the dbt project at the time it ran. Tomorrow's pull request needs this manifest to compare the production state with the current code and identify which models have changed. This enables Slim CI: instead of rebuilding the entire project, CI builds only the modified models and their downstream dependencies.
+
+4. In `--select state:modified+`, what does the `+` do? What would break if you left it off?
+
+    - Answer: the `+` in `--select state:modified+` means include all downstream dependencies of the modified models. So if left it off, downstream models would not be rebuilt, potentially leaving stale data.
+
+When you've got these, open **Docs 01**.
