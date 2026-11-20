@@ -1,0 +1,178 @@
+# Docs 01 — The project, and your `dev` environment
+
+**Goal**: get the project running on your machine, and be able to say exactly where your tables went and **why they went there**.
+
+## 1. Set up
+
+```bash
+uv sync          # installs Python 3.12 + dbt-core 1.12.5 + dbt-duckdb 1.11.0
+uv run dbt build
+```
+
+> **Why `uv run` and not plain `dbt`?** `uv run` uses the exact versions pinned in `pyproject.toml` and `uv.lock`. Your CI runner will install from those same two files, so local and CI are guaranteed identical.
+
+## 2. The three files that define the project
+
+### `pyproject.toml` — what to install
+
+Pinned to exact versions (`==`, not `>=`). CI reads the same file.
+
+### `dbt_project.yml` — what the project is
+
+```yml
+profile: dbt_duckdb_cicd      # <- which profile in profiles.yml to use
+
+models:
+  dbt_duckdb_cicd:
+    staging:
+      +materialized: view     # staging = cheap, disposable
+    marts:
+      +materialized: table    # marts = queried often, worth persisting
+```
+
+The line that matters for this project is `profile:`. It's a **pointer**. This file says **what to build**; `profiles.yml` says **where to put it**. That separation is the reason one unchanged project can build into dev, ci, or prod.
+
+> **Two names that are easy to confuse**, and here they happen to be identical:
+>
+> - `name:` is the **project** name. It's what you nest model and seed configs under, further down this same file.
+> - `profile:` is the **profile** name. It must match the top-level key in `profiles.yml`.
+>
+> `dbt init` sets both to the same string, which hides the distinction — until the day you rename the project and forget to rename the nesting keys. Then `models: old_name:` matches nothing, every `+materialized` and `+schema` silently stops applying, and dbt **does not error**. Your models just quietly become views in the wrong schema.
+>
+> If configs ever seem to be ignored, check that the key under `models:` matches `name:` exactly. It's the first thing to rule out.
+
+### `profiles.yml` — where to write
+
+```yml
+dbt_duckdb_cicd:
+  target: dev                 # <- the default when you don't pass --target
+  outputs:
+    dev:
+      type: duckdb
+      path: database/database.duckdb   # the file
+      schema: dev             # the schema inside it
+      threads: 4
+```
+
+**`outputs:` is a list of environments**. Right now there's exactly one. In Docs 02 we add `ci` and `prod` — and they'll point at the same database/database.duckdb, differing only in `schema`.
+
+> The file lives in `database/` rather than the repo root. The directory is tracked via a `.gitkeep`; the `.duckdb` file inside it is gitignored, because **the warehouse is a build output, never a source file**. You should be able to delete it and get it back with one `dbt build`.
+
+> **Two things worth noticing**.
+>
+> 1. This file is **committed to the repo**, which is normally a cardinal sin. We get away with it because DuckDB has no credentials at all. On Snowflake the structure is identical, but every secret becomes `password: "{{ env_var('DBT_PASSWORD') }}"` and lives in GitHub Secrets. **The shape never changes — only where the values come from**.
+> 2. dbt normally looks for `profiles.yml` in `~/.dbt/`. It also checks the current directory, which is why ours works. Keeping it in the repo is what lets CI use it without any extra setup.
+
+## 3. The DAG
+
+Six models:
+
+```
+raw_customers ──> stg_customers ──────────────────────────┐
+                                                           ├──> customers
+raw_orders ─────> stg_orders ──────────┐                   │
+                                       ├──> orders ────────┘
+raw_payments ───> stg_payments ──> int_order_payments ─────┘
+```
+
+The `raw_*` are seeds (CSVs in `seeds/`) standing in for source tables.
+
+**Study the shape — it's the whole reason the later docs work**. Ask yourself: if you edit `stg_payments`, which models are downstream of it? Which are not? You'll need that answer in Docs 03.
+
+## 4. Where did everything go?
+
+```bash
+uv run python -c "
+import duckdb
+con = duckdb.connect('database/database.duckdb', read_only=True)
+for r in con.execute('''
+  select table_schema, table_name, table_type
+  from information_schema.tables order by 1, 3 desc, 2
+''').fetchall(): print(f'{r[0]:<8} {r[1]:<16} {r[2]}')
+"
+```
+
+```
+dev      int_order_payments  VIEW
+dev      stg_customers       VIEW
+dev      stg_orders          VIEW
+dev      stg_payments        VIEW
+dev      customers           BASE TABLE
+dev      orders              BASE TABLE
+dev      raw_customers       BASE TABLE
+dev      raw_orders          BASE TABLE
+dev      raw_payments        BASE TABLE
+```
+
+Everything is in schema **`dev`**. Trace why, because this chain is the thing the whole course rests on:
+
+```
+you ran `dbt build` with no --target
+   └─> profiles.yml says `target: dev`
+        └─> the `dev` output says `schema: dev`
+             └─> so every model was created in schema `dev`
+```
+
+Change one word in `profiles.yml` and all nine objects land somewhere else. **That is the entire mechanism behind environments**. There is nothing more to it.
+
+## 5. The tests are not decoration
+
+`dbt build` ran 26 nodes: 3 seeds, 6 models, and **17 tests**. Those tests are the reason CI can have an opinion about your pull request.
+
+Look at `models/staging/schema.yml`:
+
+```yml
+- name: status
+  data_tests:
+    - accepted_values:
+        arguments:
+          values: ['completed', 'returned', 'placed']
+```
+
+If someone's PR introduces an order with status `'cancelled'`, this test goes red — **in the pull request, before it merges**.
+
+> The `arguments:` nesting is dbt 1.12+ syntax. Older tutorials put `values:` directly under `accepted_values:`; that still runs but emits a deprecation warning.
+
+## 6. Try it yourself
+
+**Experiment 1 — the target really is the only thing deciding where data lands**. Temporarily change `schema: dev` to `schema: dev_scratch` in `profiles.yml`, then:
+
+```bash
+uv run dbt build
+```
+
+Re-run the inspection query from section 4. You now have two full copies of your models side by side, in `dev` and `dev_scratch`, from identical SQL. One word in one file. **Change it back to `dev` before moving on**, then drop the scratch schema:
+
+```bash
+uv run python -c "import duckdb; duckdb.connect('database/database.duckdb').execute('drop schema if exists dev_scratch cascade')"
+```
+
+> **Try `dbt run` instead of `dbt build` there and it fails with 3 errors**. Worth understanding now: `run` builds models but not seeds, so the `raw_*` tables don't exist in the new schema and every staging model has nothing to read from.
+>
+> Sit with that for a second, because it's the whole problem of Docs 04 in miniature: **a model can only build if the things it references already exist in the place it's looking**. CI hits this constantly — it builds two models into an empty schema and the refs point at nothing. The fix is `--defer`.
+
+That's a preview of the real thing: `ci` and `prod` are that same one-word difference, just automated.
+
+**Experiment 2 — selecting a subset**.
+
+```bash
+uv run dbt run --select stg_payments
+```
+
+Only one model rebuilt. You already know how to select models by hand. **Hold onto that**, because Slim CI is nothing more than dbt working out that `--select` argument for you, automatically, from what the PR changed.
+
+## ✅ Checkpoint
+
+1. You run `uv run dbt build --target prod`, but `profiles.yml` has no `prod` entry yet. What happens, and which of the three config files would you fix?
+
+    - Answer: If run `dbt build --target prod` without `prod` entry in `profiles.yml`, you encounter `Runtime Error: The profile 'dbt_duckdb_cicd' does not have a target named 'prod'`. Then you have to fix `profiles.yml`.
+
+2. `stg_orders` is a **view** and `orders` is a **table**. Where is that decided — and why would a team make staging models views and marts tables?
+
+    - Answer: Staging models as views to avoid unnecessary data duplication, reduce storage costs, and keep transformations lightweight. - Mart models as tables to improve query performance and provide stable, precomputed datasets for BI tools and business users. They are decided by the `materialized` configuration in dbt. 
+
+3. Here's the one that matters. Look at the DAG in section 3. **You edit `stg_payments.sql`**. Which of the six models genuinely need rebuilding, and which are unaffected? Write down your list. We'll have dbt generate the same list mechanically in Docs 03, and you'll want to compare.
+    
+    - Answer: `stg_customers`, `stg_orders`
+
+Next: **Docs 02 — adding `ci` and `prod`**.
